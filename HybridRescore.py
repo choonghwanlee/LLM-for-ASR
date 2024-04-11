@@ -1,0 +1,1 @@
+## Approach 1: using a hybrid rescoring between Whisper predictions and BERT predictions

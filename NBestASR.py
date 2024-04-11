@@ -1,0 +1,1 @@
+## Approach 2: Selecting N-Best predictions of Whisper model, then using BERT MLM to extract the most likely token among the N-Best.

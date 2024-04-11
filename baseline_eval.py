@@ -1,0 +1,1 @@
+## Baseline evaluation of Whisper model 
