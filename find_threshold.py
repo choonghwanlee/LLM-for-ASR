@@ -1,55 +1,65 @@
-## Find threshold tau that determines whether a prediction is certain or uncertain
-
-import torch
-import numpy 
-import matplotlib.pyplot as plt
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from datasets import load_dataset
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+import torch
+import torchaudio
 
-# pipeline example
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+# Load the dataset and get the first audio sample
+dataset = load_dataset("audiofolder", data_dir="../Project/DS_10283_4836/edacc_v1.0/data", drop_labels=True, split = "train")
+audio_sample = dataset[0]["audio"]
 
-model_id = "openai/whisper-large-v3"
+# Load the Whisper model and processor
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
+processor = WhisperProcessor.from_pretrained("openai/whisper-small")
 
-model = AutoModelForSpeechSeq2Seq.from_pretrained(
-    model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
-)
-model.to(device)
+# Resample the audio data to 16000 Hz
+resampler = torchaudio.transforms.Resample(audio_sample["sampling_rate"], 16000)
+audio_tensor = torch.from_numpy(audio_sample["array"]).unsqueeze(0)
+resampled_audio = resampler(audio_tensor).squeeze(0)
 
-processor = AutoProcessor.from_pretrained(model_id)
+# Preprocess the resampled audio data
+audio_input = processor(
+    resampled_audio,
+    return_tensors="pt"
+).input_features
 
-pipe = pipeline(
-    "automatic-speech-recognition",
-    model=model,
-    tokenizer=processor.tokenizer,
-    feature_extractor=processor.feature_extractor,
-    max_new_tokens=128,
-    chunk_length_s=30,
-    batch_size=16,
-    return_timestamps=True,
-    torch_dtype=torch_dtype,
-    device=device,
-)
+# Move the input tensor to GPU if available
+if torch.cuda.is_available():
+    audio_input = audio_input.to("cuda")
 
-dataset = load_dataset("/Users/rebekahkim/Desktop/dataset/edacc_v1.0/data")
-result = pipe("/Users/rebekahkim/Desktop/dataset/edacc_v1.0/data/EACC-CO1.wav")
+# Generate the transcription
+transcription_output = model.generate(audio_input)
 
-print(result["text"])
+# Decode the transcription output
+transcription_text = processor.batch_decode(transcription_output, skip_special_tokens=True)[0]
 
+# Print the transcription
+print(transcription_text)
 
+# import torch
+# from transformers import WhisperForConditionalGeneration, WhisperProcessor
+# from datasets import load_dataset
+# import numpy as np
 
-'''
-# run the Whisper model on all the data
-predictions = [pipe(audio_file) for audio_file in dataset]
+# device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# calculate the maximum predicted probabilities for each token
-max_probs = [numpy.max(prediction['score']) for prediction in predictions]
+# model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device)
+# processor = WhisperProcessor.from_pretrained("openai/whisper-small")
 
-# plot the distribution of the maximum predicted probabilities
-plt.hist(max_probs)
-plt.title('Distribution of Maximum Predicted Probabilities')
-plt.xlabel('Probability')
-plt.ylabel('Frequency')
-plt.show()
-'''
+# ds = load_dataset("audiofolder", data_dir="../Project/DS_10283_4836/edacc_v1.0/data", drop_labels=True, split = "train")
+# audio_sample = ds[0]
+# print(ds["audio"])
+
+# audio_sample = ds[0]["audio"]
+# input_features = processor(audio_sample["array"], sampling_rate=audio_sample["sampling_rate"], return_tensors="pt").input_features.to(device)
+# generated_ids = model.generate(input_features)
+# transcription = processor.batch_decode(generated_ids.cpu(), skip_special_tokens=True)[0]
+
+# #text = audio_sample["text"].lower()
+# # speech_data = audio_sample["audio"]["array"]
+# # print(len(speech_data), speech_data)
+# # inputs = processor.feature_extractor(speech_data, return_tensors="pt", sampling_rate=16_000).input_features.to(device)
+# # inputs
+# # print(inputs.shape)
+
+# # predicted_ids = model.generate(inputs, max_length=480_000)
+# # predicted_ids
