@@ -1,65 +1,44 @@
-from datasets import load_dataset
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
+import datasets
 import torch
-import torchaudio
-
-# Load the dataset and get the first audio sample
-dataset = load_dataset("audiofolder", data_dir="../Project/DS_10283_4836/edacc_v1.0/data", drop_labels=True, split = "train")
-audio_sample = dataset[0]["audio"]
+import numpy as np
+import matplotlib.pyplot as plt
 
 # Load the Whisper model and processor
-model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
-processor = WhisperProcessor.from_pretrained("openai/whisper-small")
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-base")
+processor = WhisperProcessor.from_pretrained("openai/whisper-base")
 
-# Resample the audio data to 16000 Hz
-resampler = torchaudio.transforms.Resample(audio_sample["sampling_rate"], 16000)
-audio_tensor = torch.from_numpy(audio_sample["array"]).unsqueeze(0)
-resampled_audio = resampler(audio_tensor).squeeze(0)
+# Load the Hugging Face dataset
+dataset = datasets.load_dataset("Nexdata/accented_english", split="train")  
 
-# Preprocess the resampled audio data
-audio_input = processor(
-    resampled_audio,
-    return_tensors="pt"
-).input_features
+# Define a function to preprocess the data
+def preprocess(batch):
+    audio = batch["audio"]["array"]
+    input_features = processor(audio, return_tensors="pt")
+    return input_features
 
-# Move the input tensor to GPU if available
-if torch.cuda.is_available():
-    audio_input = audio_input.to("cuda")
+# Preprocess the dataset
+processed_dataset = dataset.map(preprocess, batched=True, batch_size=8)
 
-# Generate the transcription
-transcription_output = model.generate(audio_input)
+# List to store the maximum predicted probabilities
+max_probs = []
 
-# Decode the transcription output
-transcription_text = processor.batch_decode(transcription_output, skip_special_tokens=True)[0]
+# Iterate through the preprocessed dataset
+for batch in processed_dataset:
+    input_features = batch
+    
+    # Forward pass through the model
+    with torch.no_grad():
+        logits = model(**input_features).logits
+    
+    # Calculate probabilities and find the maximum probability for each token
+    probs = torch.softmax(logits, dim=-1)
+    max_probs.extend(probs.max(-1)[0].tolist())
 
-# Print the transcription
-print(transcription_text)
+# Plot the distribution of maximum predicted probabilities
+plt.hist(max_probs, bins=20)
+plt.title("Distribution of Maximum Predicted Probabilities")
+plt.xlabel("Maximum Probability")
+plt.ylabel("Frequency")
+plt.show()
 
-# import torch
-# from transformers import WhisperForConditionalGeneration, WhisperProcessor
-# from datasets import load_dataset
-# import numpy as np
-
-# device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device)
-# processor = WhisperProcessor.from_pretrained("openai/whisper-small")
-
-# ds = load_dataset("audiofolder", data_dir="../Project/DS_10283_4836/edacc_v1.0/data", drop_labels=True, split = "train")
-# audio_sample = ds[0]
-# print(ds["audio"])
-
-# audio_sample = ds[0]["audio"]
-# input_features = processor(audio_sample["array"], sampling_rate=audio_sample["sampling_rate"], return_tensors="pt").input_features.to(device)
-# generated_ids = model.generate(input_features)
-# transcription = processor.batch_decode(generated_ids.cpu(), skip_special_tokens=True)[0]
-
-# #text = audio_sample["text"].lower()
-# # speech_data = audio_sample["audio"]["array"]
-# # print(len(speech_data), speech_data)
-# # inputs = processor.feature_extractor(speech_data, return_tensors="pt", sampling_rate=16_000).input_features.to(device)
-# # inputs
-# # print(inputs.shape)
-
-# # predicted_ids = model.generate(inputs, max_length=480_000)
-# # predicted_ids
