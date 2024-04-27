@@ -1,39 +1,78 @@
-from datasets import load_dataset
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from datasets import load_dataset, Audio
+from transformers import WhisperForConditionalGeneration, WhisperProcessor, WhisperFeatureExtractor
 import torch
 import torchaudio
+from evaluate import load
 
-# Load the dataset and get the first audio sample
-dataset = load_dataset("audiofolder", data_dir="../Project/DS_10283_4836/edacc_v1.0/data", drop_labels=True, split = "train")
-audio_sample = dataset[0]["audio"]
 
-# Load the Whisper model and processor
+print('hi!')
+# Step 1: Load the dataset
+# dataset = load_dataset("audiofolder", data_dir="./dataset/edacc_v1.0/data", drop_labels=True, split = "train")
+dataset = load_dataset('edinburghcstr/edacc') ## install from HF instead
+
+dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000)) ## resample to 16 kHz
+
+## sample usage
+sample = dataset["validation"][0] ## sample a row from the validation dataset
+audio_sample = sample['audio'] ## audio feature
+ground_truth = sample['text'] ## ground truth transcription
+accent = sample['accent'] ## speaker accent
+
+# Step 2: Load the Whisper model and processor
 model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
 processor = WhisperProcessor.from_pretrained("openai/whisper-small")
+feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
 
-# Resample the audio data to 16000 Hz
-resampler = torchaudio.transforms.Resample(audio_sample["sampling_rate"], 16000)
-audio_tensor = torch.from_numpy(audio_sample["array"]).unsqueeze(0)
-resampled_audio = resampler(audio_tensor).squeeze(0)
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Preprocess the resampled audio data
+
+# # Resample the audio data to 16000 Hz
+# resampler = torchaudio.transforms.Resample(audio_sample["sampling_rate"], 16000)
+# audio_tensor = torch.from_numpy(audio_sample["array"]).unsqueeze(0)
+# resampled_audio = resampler(audio_tensor).squeeze(0)
+
+# Step 3: Preprocess the resampled audio data
+waveform = audio_sample["array"]
+sampling_rate = audio_sample["sampling_rate"]
+
 audio_input = processor(
-    resampled_audio,
+    waveform,
+    sampling_rate = sampling_rate,
     return_tensors="pt"
-).input_features
+)
 
-# Move the input tensor to GPU if available
-if torch.cuda.is_available():
-    audio_input = audio_input.to("cuda")
+audio_input = audio_input.to(device)
 
-# Generate the transcription
-transcription_output = model.generate(audio_input)
+# # Generate the transcription
+with torch.no_grad():
+    generated_ids = model.generate(**audio_input, task='transcribe', language='english') ## generate results
+    # logits = model.forward(**audio_input).logits ## errors out right now, need to pass in the decoder_input_ids too, for some reason
 
-# Decode the transcription output
-transcription_text = processor.batch_decode(transcription_output, skip_special_tokens=True)[0]
+transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+print(transcription)
 
-# Print the transcription
-print(transcription_text)
+## batch prediction:
+def map_fn(batch):
+    arrays = [x["array"] for x in batch["audio"]]
+    sampling_rate = [x['sampling_rate'] for x in batch['audio']]
+    input_features = processor.feature_extractor(arrays, sampling_rate=sampling_rate, return_tensors="pt").input_features.to(device)
+    sequences = model.generate(input_features, task='transcribe', language='english', use_cache=True)
+    results = processor.tokenizer.batch_decode(sequences, skip_special_tokens=True)
+    batch["predictions"] = [result for result in results]
+    batch["references"] = [processor.tokenizer._normalize(text) for text in batch["text"]]
+    return batch
+
+ds = dataset['validation'].map(map_fn, batch_size=4, remove_columns=[], batched=True) ## use a batch size of 4 
+
+
+wer = load("wer")
+wer_score = wer.compute(predictions=ds["predictions"], references=ds["references"])
+
+print(f"WER: {wer_score * 100:.2f} %")
+
+
+
+### Old Code
 
 # import torch
 # from transformers import WhisperForConditionalGeneration, WhisperProcessor
