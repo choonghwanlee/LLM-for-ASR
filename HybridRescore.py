@@ -1,17 +1,29 @@
 import os
 import torch
-from transformers import BertTokenizer, BertForSequenceClassification
-from whisper import load_model
+from transformers import BertTokenizer, BertForSequenceClassification, WhisperForConditionalGeneration, WhisperProcessor
+import torch.nn.functional as F
+# from whisper import load_model
 
 class HybridRescorer:
     def __init__(self, bert_model_name='bert-base-uncased', whisper_model_type='base'):
         self.bert_tokenizer = BertTokenizer.from_pretrained(bert_model_name)
         self.bert_model = BertForSequenceClassification.from_pretrained(bert_model_name)
-        self.whisper_model = load_model(whisper_model_type)
+        self.whisper_model = WhisperForConditionalGeneration.from_pretrained(whisper_model_type)
+        self.whisper_model.generation_config.output_logits = True
+        self.whisper_processor = WhisperProcessor.from_pretrained(whisper_model_type)
+        # self.whisper_model = load_model(whisper_model_type)
 
-    def predict_with_whisper(self, audio_path):
-        result = self.whisper_model.transcribe(audio_path)
-        return result['text']
+    def predict_with_whisper(self, waveform, sampling_rate):
+        audio_input = self.whisper_processor(
+            waveform,
+            sampling_rate = sampling_rate,
+            return_tensors="pt"
+        ).input_features
+        result = self.whisper_model.generate(audio_input, generation_config= self.whisper_model.generation_config, task='transcribe', language='english')
+        transcription = self.whisper_processor.batch_decode(result['sequences'], skip_special_tokens=True)[0]
+        normalized_probs = [F.softmax(logit) for logit in result['logits']]
+        max_prob_per_token = [torch.max(probs).item() for probs in normalized_probs]
+        return transcription, max_prob_per_token
 
     def score_with_bert(self, text):
         inputs = self.bert_tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)

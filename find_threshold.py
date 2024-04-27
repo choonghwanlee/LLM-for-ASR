@@ -1,15 +1,12 @@
 from datasets import load_dataset, Audio
-from transformers import WhisperForConditionalGeneration, WhisperProcessor, WhisperFeatureExtractor
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
 import torch
+import torch.nn.functional as F
 import torchaudio
-from evaluate import load
+import matplotlib.pyplot as plt
 
-
-print('hi!')
 # Step 1: Load the dataset
-# dataset = load_dataset("audiofolder", data_dir="./dataset/edacc_v1.0/data", drop_labels=True, split = "train")
 dataset = load_dataset('edinburghcstr/edacc') ## install from HF instead
-
 dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000)) ## resample to 16 kHz
 
 ## sample usage
@@ -19,17 +16,12 @@ ground_truth = sample['text'] ## ground truth transcription
 accent = sample['accent'] ## speaker accent
 
 # Step 2: Load the Whisper model and processor
-model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
-processor = WhisperProcessor.from_pretrained("openai/whisper-small")
-feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device)
+processor = WhisperProcessor.from_pretrained("openai/whisper-small")
 
-
-# # Resample the audio data to 16000 Hz
-# resampler = torchaudio.transforms.Resample(audio_sample["sampling_rate"], 16000)
-# audio_tensor = torch.from_numpy(audio_sample["array"]).unsqueeze(0)
-# resampled_audio = resampler(audio_tensor).squeeze(0)
+## change configs to allow logits and scores
+model.generation_config.output_logits = True
 
 # Step 3: Preprocess the resampled audio data
 waveform = audio_sample["array"]
@@ -39,36 +31,49 @@ audio_input = processor(
     waveform,
     sampling_rate = sampling_rate,
     return_tensors="pt"
-)
+).input_features
 
 audio_input = audio_input.to(device)
 
-# # Generate the transcription
+# Step 4: Generate the transcription
 with torch.no_grad():
-    generated_ids = model.generate(**audio_input, task='transcribe', language='english') ## generate results
-    # logits = model.forward(**audio_input).logits ## errors out right now, need to pass in the decoder_input_ids too, for some reason
+    ## output is a dictionary with keys ['sequences', 'logits', 'past_key_values']. we only care about the first two
+    output = model.generate(input_features=audio_input, generation_config= model.generation_config, task='transcribe', language='english', return_dict_in_generate=True) ## generate results
 
-transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-print(transcription)
+## get the actual prediction
+transcription = processor.batch_decode(output['sequences'], skip_special_tokens=True)[0]
+print('Sample Transcription Results: ', transcription)
+print('Ground Truth Results: ', ground_truth)
 
-## batch prediction:
-def map_fn(batch):
-    arrays = [x["array"] for x in batch["audio"]]
-    sampling_rate = [x['sampling_rate'] for x in batch['audio']]
-    input_features = processor.feature_extractor(arrays, sampling_rate=sampling_rate, return_tensors="pt").input_features.to(device)
-    sequences = model.generate(input_features, task='transcribe', language='english', use_cache=True)
-    results = processor.tokenizer.batch_decode(sequences, skip_special_tokens=True)
-    batch["predictions"] = [result for result in results]
-    batch["references"] = [processor.tokenizer._normalize(text) for text in batch["text"]]
-    return batch
+# normalized_probs = [F.softmax(logit) for logit in output['logits']] ## obtain normalized probabilities for each token in transcription
+# max_prob_per_token = [torch.max(probs).item() for probs in normalized_probs] ### model's confidence on a token
 
-ds = dataset['validation'].map(map_fn, batch_size=4, remove_columns=[], batched=True) ## use a batch size of 4 
+###############################
 
-wer = load("wer")
-wer_score = wer.compute(predictions=ds["predictions"], references=ds["references"])
+def _process_logits(logits):
+    normalized_probs = [F.softmax(logit) for logit in logits] ## obtain normalized probabilities for each token in transcription
+    max_prob_per_token = [torch.max(probs).item() for probs in normalized_probs] ### model's confidence on a token
+    ## a list of highest probabilities for each token in a sample 
+    return max_prob_per_token
 
-print(f"WER: {wer_score * 100:.2f} %")
+distribution = []
+# num_correct = []
+def _get_max_probs(examples):
+    waveforms = [x["array"] for x in examples["audio"]]
+    sampling_rate = examples['audio'][0]['sampling_rate']    
+    input_features = processor.feature_extractor(waveforms, sampling_rate=sampling_rate, return_tensors="pt").input_features.to(device)
+    outputs = model.generate(input_features, generation_config= model.generation_config, task='transcribe', language='english', return_dict_in_generate=True, use_cache=True)
+    batch_probs = [_process_logits(output['logits']) for output in outputs] ## list of lists of highest probabilities for each token in a sample 
+    distribution.extend([probs for batch in batch_probs for probs in batch]) ## flatten and add to global list
 
+
+dataset['validation'].map(lambda example: _get_max_probs(example), batched=True, batch_size=4)
+
+print(len(distribution))
+
+## use matplotlib to plot a two-axes histogram where x is the max token probability generated by the model 
+## and y is 1) a distribution of frequency and 2) distribution of accuracy (% correct)
+## we can use this to determine the optimal value for the threshold <== a threshold value where the error spikes
 
 
 ### Old Code
