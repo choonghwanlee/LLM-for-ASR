@@ -64,7 +64,6 @@ def map_fn(batch):
 
 ds = dataset['validation'].map(map_fn, batch_size=4, remove_columns=[], batched=True) ## use a batch size of 4 
 
-
 wer = load("wer")
 wer_score = wer.compute(predictions=ds["predictions"], references=ds["references"])
 
