@@ -6,11 +6,10 @@ from transformers import BertTokenizer, BertForMaskedLM
 from datasets import load_dataset
 from jiwer import wer, wil, mer
 
-# Load Whisper model
 model_whisper = whisper.load_model("base")
 
 
-# Function to transcribe audio with Whisper
+# Whisper ASR Transcription
 def transcribe_audio(audio_path):
     audio = whisper.load_audio(audio_path)
     audio = whisper.pad_or_trim(audio)
@@ -20,12 +19,11 @@ def transcribe_audio(audio_path):
     return result.text, result.tokens
 
 
-# Load BERT model and tokenizer for Masked LM
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 model_bert = BertForMaskedLM.from_pretrained("bert-base-uncased")
 
 
-# Function to mask uncertain tokens
+# Mask uncertain tokens
 def mask_uncertain_tokens(transcription, tokens, threshold=0.5):
     masked_transcription = []
     words = transcription.split()
@@ -37,21 +35,18 @@ def mask_uncertain_tokens(transcription, tokens, threshold=0.5):
     return " ".join(masked_transcription)
 
 
-# Function to predict masked tokens using BERT
+# Use BERT to predict masked tokens
 def predict_masks(masked_text):
     input_ids = tokenizer(masked_text, return_tensors="pt").input_ids
     logits = model_bert(input_ids).logits
     mask_token_index = (input_ids == tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
 
-    # Get the predicted token IDs
-    predicted_token_ids = logits.argmax(dim=2)[
-        0, mask_token_index
-    ].tolist()  # Simplified and corrected
+    predicted_token_ids = logits.argmax(dim=2)[0, mask_token_index].tolist()
     predicted_tokens = [tokenizer.decode([id]).strip() for id in predicted_token_ids]
 
     # Replace [MASK] with predicted tokens
     words = masked_text.split()
-    mask_counter = 0  # To keep track of which [MASK] to replace
+    mask_counter = 0
     for i, word in enumerate(words):
         if word == "[MASK]":
             words[i] = predicted_tokens[mask_counter]
@@ -60,7 +55,7 @@ def predict_masks(masked_text):
     return " ".join(words)
 
 
-# Evaluate transcription accuracy
+# Evaluation metrics
 def evaluate_transcription(original, corrected):
     return {
         "WER": wer(original, corrected),
@@ -69,7 +64,6 @@ def evaluate_transcription(original, corrected):
     }
 
 
-# Process dataset
 data_dir = r"/Users/arthurzhao/Documents/CS390/SpeechData/edacc_v1.0/data/"
 dataset = load_dataset(data_dir)
 
