@@ -4,7 +4,11 @@ from transformers import WhisperForConditionalGeneration, WhisperProcessor
 import torch
 import torchaudio
 import matplotlib.pyplot as plt
-# from evaluate import load
+import numpy 
+import pandas
+import jiwer
+import werpy
+from evaluate import load
 
 
 # Step 1: Load the dataset
@@ -12,28 +16,51 @@ dataset = load_dataset('edinburghcstr/edacc') ## install from HF instead
 dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000)) ## resample to 16 kHz
 
 ## sample usage
-sample = dataset["validation"][0] ## sample a row from the validation dataset
+sample = dataset["test"] ## sample a row from the validation dataset
 audio_sample = sample['audio'] ## audio feature
 ground_truth = sample['text'] ## ground truth transcription
-accent = sample['accent'] ## speaker accent
+accent = sample['accent'] ## speaker accent 
+
+# Filter the dataset to include only samples with ground truth text longer than 10 words
+def filter_function(sample):
+    ground_truth = werpy.normalize(sample['text'])
+    return len(ground_truth.split()) > 10
+
+filtered_dataset = dataset.filter(filter_function)
 
 # Step 2: Load the Whisper model and processor
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device)
 processor = WhisperProcessor.from_pretrained("openai/whisper-small")
 
-## batch prediction – move to a separate eval script:
-def map_fn(batch):
-    arrays = [x["array"] for x in batch["audio"]]
-    sampling_rate = [x['sampling_rate'] for x in batch['audio']]
-    input_features = processor.feature_extractor(arrays, sampling_rate=sampling_rate[0], return_tensors="pt").input_features.to(device)
-    sequences = model.generate(input_features, task='transcribe', language='english', use_cache=True)
-    results = processor.tokenizer.batch_decode(sequences, skip_special_tokens=True)
-    batch["predictions"] = [result for result in results]
-    batch["references"] = [processor.tokenizer._normalize(text) for text in batch["text"]]
-    return batch
+## change configs to allow logits and scores
+model.generation_config.output_logits = True
 
-ds = dataset['validation'].map(map_fn, batch_size=4, remove_columns=[], batched=True) ## use a batch size of 4
+candidates = []
+references = [] 
+
+# Step 3: Preprocess the resampled audio data
+for sample in filtered_dataset["test"]:
+    audio_sample = sample['audio']
+    ground_truth = sample['text']
+    waveform = audio_sample["array"]
+    sampling_rate = audio_sample["sampling_rate"]
+    audio_input = processor(waveform, sampling_rate=sampling_rate, return_tensors="pt").input_features
+    audio_input = audio_input.to(device)
+
+    # Step 4: Generate the transcription
+    with torch.no_grad():
+        output = model.generate(input_features=audio_input, generation_config=model.generation_config, task='transcribe', language='english', return_dict_in_generate=True)
+
+    # Get the actual prediction
+    transcription = processor.batch_decode(output['sequences'], skip_special_tokens=True)[0]
+    candidate = werpy.normalize(transcription)
+    candidates.append(candidate)
+    reference = werpy.normalize(ground_truth)
+    references.append(reference)
+
+print(len(candidates))
+print(len(references))
 
 # wer = load("wer") 
 # wer_score = wer.compute(predictions=ds["predictions"], references=ds["references"])
