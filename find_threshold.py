@@ -1,88 +1,91 @@
 from datasets import load_dataset, Audio
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers import WhisperForConditionalGeneration, WhisperProcessor, BertTokenizer, BertForMaskedLM
 import torch
 import torch.nn.functional as F
-import torchaudio
-import matplotlib.pyplot as plt
 
-# Step 1: Load the dataset
-dataset = load_dataset('edinburghcstr/edacc') ## install from HF instead
-dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000)) ## resample to 16 kHz
-
-# Shuffle the validation set
-validation_set = dataset['validation']
-validation_set = validation_set.shuffle(seed=42)  # Set a seed for reproducibility
-
-# Select 1000 random entries from the shuffled validation set
-subset = validation_set.select(range(1000))
-
-## sample usage
-sample = dataset["validation"][0] ## sample a row from the validation dataset
-audio_sample = sample['audio'] ## audio feature
-ground_truth = sample['text'] ## ground truth transcription
-accent = sample['accent'] ## speaker accent
-
-# Step 2: Load the Whisper model and processor
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device)
-processor = WhisperProcessor.from_pretrained("openai/whisper-small")
-
-## change configs to allow logits and scores
-model.generation_config.output_logits = True
-
-# Step 3: Preprocess the resampled audio data
-waveform = audio_sample["array"]
-sampling_rate = audio_sample["sampling_rate"]
-
-audio_input = processor(
-    waveform,
-    sampling_rate = sampling_rate,
-    return_tensors="pt"
-).input_features
-
-audio_input = audio_input.to(device)
-
-# Step 4: Generate the transcription
-with torch.no_grad():
-    ## output is a dictionary with keys ['sequences', 'logits', 'past_key_values']. we only care about the first two
-    output = model.generate(input_features=audio_input, generation_config= model.generation_config, task='transcribe', language='english', return_dict_in_generate=True) ## generate results
-
-## get the actual prediction
-transcription = processor.batch_decode(output['sequences'], skip_special_tokens=True)[0]
-print('Sample Transcription Results: ', transcription)
-print('Ground Truth Results: ', ground_truth)
-
-# normalized_probs = [F.softmax(logit) for logit in output['logits']] ## obtain normalized probabilities for each token in transcription
-# max_prob_per_token = [torch.max(probs).item() for probs in normalized_probs] ### model's confidence on a token
-
-###############################
+def init_models(device):
+    whisper_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device)
+    whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-small")
+    bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    bert_model = BertForMaskedLM.from_pretrained('bert-base-uncased').to(device)
+    return whisper_model, whisper_processor, bert_tokenizer, bert_model
 
 def _process_logits(logits):
+    # Initialize an empty list to store max probabilities for each token
     normalized_probs = [F.softmax(logit) for logit in logits] ## obtain normalized probabilities for each token in transcription
     max_prob_per_token = [torch.max(probs).item() for probs in normalized_probs] ### model's confidence on a token
     ## a list of highest probabilities for each token in a sample
+    print(max_prob_per_token)
     return max_prob_per_token
 
-distribution = []
-# num_correct = []
-def _get_max_probs(examples):
-    waveforms = [x["array"] for x in examples["audio"]]
-    sampling_rate = examples['audio'][0]['sampling_rate']
-    input_features = processor.feature_extractor(waveforms, sampling_rate=sampling_rate, return_tensors="pt").input_features.to(device)
-    outputs = model.generate(input_features, generation_config= model.generation_config, task='transcribe', language='english', return_dict_in_generate=True, use_cache=True)
-    batch_probs = [_process_logits(logits) for logits in outputs['logits']] ## list of lists of highest probabilities for each token in a sample
-    distribution.extend([probs for batch in batch_probs for probs in batch]) ## flatten and add to global list
+def process_and_predict(batch, whisper_model, whisper_processor, bert_tokenizer, bert_model, device, gamma=0.5, threshold=0.5):
+    inputs = whisper_processor(batch["audio"]["array"], return_tensors="pt", sampling_rate=16000)
+    input_features = inputs.input_features.to(device)
 
+    whisper_output = whisper_model.generate(input_features, output_scores=True, return_dict_in_generate=True)
+    transcriptions = whisper_processor.batch_decode(whisper_output.sequences, skip_special_tokens=True)
+    logits = list(whisper_output.scores)
+    whisper_token_probs = _process_logits(logits)
 
-subset.map(lambda example: _get_max_probs(example), batched=True, batch_size=4)
+    predictions = []
+    for idx, transcription in enumerate(transcriptions):
+        tokens = bert_tokenizer.tokenize(transcription)
+        masked_input = bert_tokenizer(transcription, return_tensors="pt").to(device)
+        bert_output = bert_model(**masked_input)
+        bert_scores = bert_output.logits.softmax(dim=-1)
 
-print(len(distribution))
+        combined_tokens = []
+        combined_token_probs = []
 
-# Plot the distribution of maximum predicted probabilities
-plt.figure(figsize=(10, 6))
-plt.hist(distribution, bins=100, color='skyblue', alpha=0.7)
-plt.xlabel('Maximum Predicted Probability')
-plt.ylabel('Frequency')
-plt.title('Distribution of Maximum Predicted Probabilities')
-plt.grid(True)
-plt.show()
+        # Ensure the indices for both models align
+        token_length = min(len(tokens), len(whisper_token_probs))
+        for token_idx in range(token_length):
+            whisper_max_prob = whisper_token_probs[token_idx]
+            bert_prob = bert_scores[0, token_idx].max().item()
+
+            if whisper_max_prob < threshold:
+                if token_idx < len(whisper_output.scores[0]):
+                    combined_prob = (1 - gamma) * whisper_output.scores[0][token_idx] + gamma * bert_scores[0, token_idx]
+                    best_token_id = combined_prob.argmax()
+                    best_combined_prob = combined_prob.max().item()
+                else:
+                    best_token_id = bert_scores[0, token_idx].argmax()
+                    best_combined_prob = bert_prob
+            else:
+                best_token_id = whisper_output.scores[0][token_idx].argmax() if token_idx < len(whisper_output.scores[0]) else bert_scores[0, token_idx].argmax()
+                best_combined_prob = whisper_max_prob
+
+            best_token = bert_tokenizer.decode([best_token_id])
+            combined_tokens.append(best_token)
+            combined_token_probs.append(best_combined_prob)
+
+        corrected_transcription = ' '.join(combined_tokens)
+        predictions.append({
+            "original_transcription": transcription,
+            "corrected_transcription": corrected_transcription,
+            "whisper_token_probs": whisper_token_probs,
+            "combined_token_probs": combined_token_probs
+        })
+
+    return predictions
+
+def load_and_preprocess_data():
+    dataset = load_dataset("edinburghcstr/edacc")
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+    filtered_dataset = dataset.filter(lambda sample: 15 <= len(sample['text'].split()) <= 100)
+    return filtered_dataset['test']
+
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    whisper_model, whisper_processor, bert_tokenizer, bert_model = init_models(device)
+    test_dataset = load_and_preprocess_data()
+
+    for i, batch in enumerate(test_dataset):
+        if i < 10:  # Process only the first 10 samples for demonstration
+            results = process_and_predict(batch, whisper_model, whisper_processor, bert_tokenizer, bert_model, device, gamma=0.5, threshold=0.5)
+            for result in results:
+                print(f"Original: {result['original_transcription']}")
+                print(f"Corrected: {result['corrected_transcription']}")
+                print("Whisper Probabilities:", result['whisper_token_probs'])
+                print("Hybrid Probabilities:", result['combined_token_probs'])
+                print("\n")

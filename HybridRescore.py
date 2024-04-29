@@ -1,10 +1,5 @@
 from datasets import load_dataset, Audio
-from transformers import (
-    WhisperForConditionalGeneration,
-    WhisperProcessor,
-    BertTokenizer,
-    BertForMaskedLM,
-)
+from transformers import WhisperForConditionalGeneration, WhisperProcessor, BertTokenizer, BertForMaskedLM
 import torch
 import torch.nn.functional as F
 
@@ -15,51 +10,49 @@ def init_models(device):
     bert_model = BertForMaskedLM.from_pretrained('bert-base-uncased').to(device)
     return whisper_model, whisper_processor, bert_tokenizer, bert_model
 
+def _process_logits(logits):
+    # Initialize an empty list to store max probabilities for each token
+    normalized_probs = [F.softmax(logit) for logit in logits] ## obtain normalized probabilities for each token in transcription
+    max_prob_per_token = [torch.max(probs).item() for probs in normalized_probs] ### model's confidence on a token
+    ## a list of highest probabilities for each token in a sample
+    print(max_prob_per_token)
+    return max_prob_per_token
+
 def process_and_predict(batch, whisper_model, whisper_processor, bert_tokenizer, bert_model, device, gamma=0.5, threshold=0.5):
     inputs = whisper_processor(batch["audio"]["array"], return_tensors="pt", sampling_rate=16000)
     input_features = inputs.input_features.to(device)
 
-    # Generate predictions and extract logits
     whisper_output = whisper_model.generate(input_features, output_scores=True, return_dict_in_generate=True)
     transcriptions = whisper_processor.batch_decode(whisper_output.sequences, skip_special_tokens=True)
-
-
-    logits = whisper_output.scores[0]  # Extract logits from the output
-
-    # Apply softmax to convert logits to probabilities
-    probabilities = F.softmax(logits, dim=-1)
-
-    print("Probabilities:", probabilities)
-    print("Sum of probabilities:", torch.sum(probabilities))
-
+    logits = list(whisper_output.scores)
+    whisper_token_probs = _process_logits(logits)
 
     predictions = []
-    for idx, (transcription, prob) in enumerate(zip(transcriptions, probabilities)):
+    for idx, transcription in enumerate(transcriptions):
         tokens = bert_tokenizer.tokenize(transcription)
         masked_input = bert_tokenizer(transcription, return_tensors="pt").to(device)
-        
-        # Get BERT predictions
         bert_output = bert_model(**masked_input)
         bert_scores = bert_output.logits.softmax(dim=-1)
-        
+
         combined_tokens = []
-        whisper_token_probs = []
         combined_token_probs = []
 
-        for token_idx, token in enumerate(tokens):
-            # Extract the maximum probability for the predicted token
-            whisper_max_prob = prob[token_idx].max().item()
-            bert_prob = bert_scores[0, token_idx].max().item()  # Correctly define bert_prob
-
-            whisper_token_probs.append(whisper_max_prob)
+        # Ensure the indices for both models align
+        token_length = min(len(tokens), len(whisper_token_probs))
+        for token_idx in range(token_length):
+            whisper_max_prob = whisper_token_probs[token_idx]
+            bert_prob = bert_scores[0, token_idx].max().item()
 
             if whisper_max_prob < threshold:
-                # Apply hybrid rescoring only if below threshold
-                combined_prob = (1 - gamma) * prob[token_idx] + gamma * bert_scores[0, token_idx]  # Use full bert_scores for that token
-                best_token_id = combined_prob.argmax()
-                best_combined_prob = combined_prob.max().item()
+                if token_idx < len(whisper_output.scores[0]):
+                    combined_prob = (1 - gamma) * whisper_output.scores[0][token_idx] + gamma * bert_scores[0, token_idx]
+                    best_token_id = combined_prob.argmax()
+                    best_combined_prob = combined_prob.max().item()
+                else:
+                    best_token_id = bert_scores[0, token_idx].argmax()
+                    best_combined_prob = bert_prob
             else:
-                best_token_id = prob[token_idx].argmax()
+                best_token_id = whisper_output.scores[0][token_idx].argmax() if token_idx < len(whisper_output.scores[0]) else bert_scores[0, token_idx].argmax()
                 best_combined_prob = whisper_max_prob
 
             best_token = bert_tokenizer.decode([best_token_id])
@@ -76,30 +69,17 @@ def process_and_predict(batch, whisper_model, whisper_processor, bert_tokenizer,
 
     return predictions
 
- 
 def load_and_preprocess_data():
-    # Load the dataset
     dataset = load_dataset("edinburghcstr/edacc")
-    
-    # Cast the 'audio' column to Audio format with the desired sample rate
     dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+    filtered_dataset = dataset.filter(lambda sample: 15 <= len(sample['text'].split()) <= 100)
+    return filtered_dataset['test']
 
-    # Filter the dataset to include only entries with text lengths within a specific range
-    def filter_function(sample):
-        return 15 <= len(sample['text'].split()) <= 100  # Adjust this range as needed
-
-    # Apply the filter function
-    filtered_dataset = dataset.filter(filter_function)
-    
-    return filtered_dataset['test']  # Assuming you want to work with the test split for predictions
-
-# Running the entire script
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     whisper_model, whisper_processor, bert_tokenizer, bert_model = init_models(device)
     test_dataset = load_and_preprocess_data()
 
-    # Process each batch in the dataset
     for i, batch in enumerate(test_dataset):
         if i < 10:  # Process only the first 10 samples for demonstration
             results = process_and_predict(batch, whisper_model, whisper_processor, bert_tokenizer, bert_model, device, gamma=0.5, threshold=0.5)
