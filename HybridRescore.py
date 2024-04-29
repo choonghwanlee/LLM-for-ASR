@@ -10,12 +10,14 @@ def init_models(device):
     bert_model = BertForMaskedLM.from_pretrained('bert-base-uncased').to(device)
     return whisper_model, whisper_processor, bert_tokenizer, bert_model
 
-def _process_logits(logits):
-    # Initialize an empty list to store max probabilities for each token
-    normalized_probs = [F.softmax(logit) for logit in logits] ## obtain normalized probabilities for each token in transcription
-    max_prob_per_token = [torch.max(probs).item() for probs in normalized_probs] ### model's confidence on a token
-    ## a list of highest probabilities for each token in a sample
-    print(max_prob_per_token)
+def _process_logits(logits_list):
+    max_prob_per_token = []
+    for logits in logits_list:
+        # Apply softmax to convert logits to probabilities for each token
+        normalized_probs = F.softmax(logits, dim=-1)
+        # Get the maximum probability for each token
+        max_probs = torch.max(normalized_probs, dim=1)[0]  # Ensure max is taken across the correct dimension
+        max_prob_per_token.extend(max_probs.tolist())
     return max_prob_per_token
 
 def process_and_predict(batch, whisper_model, whisper_processor, bert_tokenizer, bert_model, device, gamma=0.5, threshold=0.5):
@@ -24,8 +26,8 @@ def process_and_predict(batch, whisper_model, whisper_processor, bert_tokenizer,
 
     whisper_output = whisper_model.generate(input_features, output_scores=True, return_dict_in_generate=True)
     transcriptions = whisper_processor.batch_decode(whisper_output.sequences, skip_special_tokens=True)
-    logits = list(whisper_output.scores)
-    whisper_token_probs = _process_logits(logits)
+    logits_list = whisper_output.scores  # This assumes scores are a list of logits tensors
+    whisper_token_probs = _process_logits(logits_list)
 
     predictions = []
     for idx, transcription in enumerate(transcriptions):
@@ -37,22 +39,19 @@ def process_and_predict(batch, whisper_model, whisper_processor, bert_tokenizer,
         combined_tokens = []
         combined_token_probs = []
 
-        # Ensure the indices for both models align
-        token_length = min(len(tokens), len(whisper_token_probs))
-        for token_idx in range(token_length):
+        # Ensure we do not exceed the bounds of available token probabilities
+        num_tokens = min(len(tokens), len(whisper_token_probs))
+        for token_idx in range(num_tokens):
             whisper_max_prob = whisper_token_probs[token_idx]
             bert_prob = bert_scores[0, token_idx].max().item()
 
             if whisper_max_prob < threshold:
-                if token_idx < len(whisper_output.scores[0]):
-                    combined_prob = (1 - gamma) * whisper_output.scores[0][token_idx] + gamma * bert_scores[0, token_idx]
-                    best_token_id = combined_prob.argmax()
-                    best_combined_prob = combined_prob.max().item()
-                else:
-                    best_token_id = bert_scores[0, token_idx].argmax()
-                    best_combined_prob = bert_prob
+                # Mix probabilities from Whisper and BERT using the gamma factor
+                combined_prob = (1 - gamma) * torch.full_like(bert_scores[0, token_idx], whisper_max_prob) + gamma * bert_scores[0, token_idx]
+                best_token_id = combined_prob.argmax()
+                best_combined_prob = combined_prob.max().item()
             else:
-                best_token_id = whisper_output.scores[0][token_idx].argmax() if token_idx < len(whisper_output.scores[0]) else bert_scores[0, token_idx].argmax()
+                best_token_id = bert_scores[0, token_idx].argmax()
                 best_combined_prob = whisper_max_prob
 
             best_token = bert_tokenizer.decode([best_token_id])
@@ -63,7 +62,7 @@ def process_and_predict(batch, whisper_model, whisper_processor, bert_tokenizer,
         predictions.append({
             "original_transcription": transcription,
             "corrected_transcription": corrected_transcription,
-            "whisper_token_probs": whisper_token_probs,
+            "whisper_token_probs": whisper_token_probs[:num_tokens],  # Adjust to actual number used
             "combined_token_probs": combined_token_probs
         })
 
