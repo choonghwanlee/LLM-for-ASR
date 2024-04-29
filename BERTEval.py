@@ -1,76 +1,109 @@
-## Approach 3: Exclusively using BERT MLM predictions to evaluate the uncertain token
-
-import whisper
+from datasets import load_dataset, Audio
+from transformers import (
+    WhisperForConditionalGeneration,
+    WhisperProcessor,
+    BertTokenizer,
+    BertForMaskedLM,
+)
 import torch
-from transformers import BertTokenizer, BertForMaskedLM
-from datasets import load_dataset
-from jiwer import wer, wil, mer
-
-model_whisper = whisper.load_model("base")
+import re
+import jiwer
 
 
-# Whisper ASR Transcription
-def transcribe_audio(audio_path):
-    audio = whisper.load_audio(audio_path)
-    audio = whisper.pad_or_trim(audio)
-    mel = whisper.log_mel_spectrogram(audio).to(model_whisper.device)
-    options = whisper.DecodingOptions()
-    result = whisper.decode(model_whisper, mel, options)
-    return result.text, result.tokens
+def filter_function(sample):
+    return 15 <= len(sample["text"].split()) <= 100
 
 
-tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-model_bert = BertForMaskedLM.from_pretrained("bert-base-uncased")
+def contains_number(text):
+    return bool(re.search(r"\d", text))
 
 
-# Mask uncertain tokens
-def mask_uncertain_tokens(transcription, tokens, threshold=0.5):
-    masked_transcription = []
-    words = transcription.split()
-    for word, token in zip(words, tokens):
-        if token < threshold:
-            masked_transcription.append("[MASK]")
-        else:
-            masked_transcription.append(word)
-    return " ".join(masked_transcription)
+def load_and_filter_data():
+    dataset = load_dataset("edinburghcstr/edacc")
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000))
+    filtered_dataset = dataset.filter(filter_function)
+    sampled_dataset = (
+        filtered_dataset["test"].shuffle().select(range(100))
+    )  # Select a smaller sample for testing
+    return sampled_dataset
 
 
-# Use BERT to predict masked tokens
-def predict_masks(masked_text):
-    input_ids = tokenizer(masked_text, return_tensors="pt").input_ids
-    logits = model_bert(input_ids).logits
-    mask_token_index = (input_ids == tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
-
-    predicted_token_ids = logits.argmax(dim=2)[0, mask_token_index].tolist()
-    predicted_tokens = [tokenizer.decode([id]).strip() for id in predicted_token_ids]
-
-    # Replace [MASK] with predicted tokens
-    words = masked_text.split()
-    mask_counter = 0
-    for i, word in enumerate(words):
-        if word == "[MASK]":
-            words[i] = predicted_tokens[mask_counter]
-            mask_counter += 1
-
-    return " ".join(words)
+def init_models():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    whisper_model = WhisperForConditionalGeneration.from_pretrained(
+        "openai/whisper-small"
+    ).to(device)
+    whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-small")
+    bert_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    bert_model = BertForMaskedLM.from_pretrained("bert-base-uncased").to(device)
+    return device, whisper_model, whisper_processor, bert_tokenizer, bert_model
 
 
-# Evaluation metrics
-def evaluate_transcription(original, corrected):
+def process_and_predict(
+    data, whisper_model, whisper_processor, bert_tokenizer, bert_model, device
+):
+    predictions = []
+    references = []
+
+    for batch in data:
+        input_features = whisper_processor(
+            batch["audio"]["array"], return_tensors="pt", sampling_rate=16000
+        )
+        output = whisper_model.generate(
+            **input_features.to(device),
+            output_scores=True,
+            return_dict_in_generate=True,
+        )
+        transcriptions = whisper_processor.batch_decode(
+            output.sequences, skip_special_tokens=True
+        )
+
+        for transcription, scores in zip(transcriptions, output.scores):
+            tokens = whisper_processor.tokenizer.tokenize(transcription)
+            uncertain_tokens = [
+                i for i, score in enumerate(scores) if score.max().item() < 0.5
+            ]
+            masked_transcription = transcription
+
+            for idx in uncertain_tokens:
+                tokens[idx] = "[MASK]"
+            masked_transcription = " ".join(tokens)
+
+            bert_input = bert_tokenizer(masked_transcription, return_tensors="pt")
+            masked_indices = torch.where(
+                bert_input["input_ids"] == bert_tokenizer.mask_token_id
+            )[1]
+            predictions_bert = bert_model(**bert_input.to(device)).logits
+
+            for idx in masked_indices:
+                predicted_token_id = predictions_bert[0, idx].argmax(axis=-1)
+                tokens[idx] = bert_tokenizer.decode([predicted_token_id])
+
+            corrected_transcription = " ".join(tokens)
+            predictions.append(corrected_transcription)
+            references.append(batch["text"])
+
+    return predictions, references
+
+
+def compute_metrics(predictions, references):
     return {
-        "WER": wer(original, corrected),
-        "WIL": wil(original, corrected),
-        "MER": mer(original, corrected),
+        "WER": jiwer.wer(references, predictions) * 100,
+        "MER": jiwer.mer(references, predictions) * 100,
+        "WIL": jiwer.wil(references, predictions) * 100,
     }
 
 
-data_dir = r"/Users/arthurzhao/Documents/CS390/SpeechData/edacc_v1.0/data/"
-dataset = load_dataset(data_dir)
+# Main function
+def main():
+    data = load_and_filter_data()
+    device, whisper_model, whisper_processor, bert_tokenizer, bert_model = init_models()
+    predictions, references = process_and_predict(
+        data, whisper_model, whisper_processor, bert_tokenizer, bert_model, device
+    )
+    metrics = compute_metrics(predictions, references)
+    print(metrics)
 
-for path in dataset["train"]["audio"]:
-    audio_path = path["path"]
-    transcription, tokens = transcribe_audio(audio_path)
-    uncertain_text = mask_uncertain_tokens(transcription, tokens)
-    corrected_text = predict_masks(uncertain_text)
-    evaluation = evaluate_transcription(transcription, corrected_text)
-    print(evaluation)
+
+if __name__ == "__main__":
+    main()
