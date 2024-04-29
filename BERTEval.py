@@ -10,6 +10,7 @@ import torch
 import re
 import jiwer
 import werpy
+import inflect
 
 
 def init_models():
@@ -55,16 +56,35 @@ def filter_function(sample):
     # return 15 <= len(sample["text"].split()) <= 100
 
 
-def contains_number(text):
-    return bool(re.search(r"\d", text))
+def replace_numbers_with_words(text):
+    p = inflect.engine()
+
+    def num_to_words(match):
+        number = match.group(0)
+        return p.number_to_words(number)
+
+    result = re.sub(r"\b\d+\b", num_to_words, text)
+    return result
+
+
+def join_words(words):
+    sentence = ""
+    for word in words:
+        if word in {",", ".", "!", "?", ":", ";", "'"}:
+            sentence += word
+        else:
+            if sentence and not sentence.endswith(" "):
+                sentence += " "
+            sentence += word
+    return sentence
 
 
 def load_and_filter_data():
     dataset = load_dataset("edinburghcstr/edacc")
     dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000))
     filtered_dataset = dataset.filter(filter_function)
-    sampled_dataset = filtered_dataset["test"].select(
-        range(10)
+    sampled_dataset = (
+        filtered_dataset["test"].shuffle().select(range(10))
     )  # Select a smaller sample for testing
     return sampled_dataset
 
@@ -93,23 +113,26 @@ def process_and_predict(
         transcription = whisper_processor.batch_decode(
             output.sequences, skip_special_tokens=True
         )[0]
+        transcription = normalize(transcription)
+        transcription = replace_numbers_with_words(transcription)
         print("Original transcription:", transcription)
 
         tokens = whisper_processor.tokenizer.tokenize(transcription)
         tokens = [token.replace("Ġ", "") for token in tokens]
-        print(tokens)
+
+        print("Tokens:", tokens)
 
         scores = [
             torch.softmax(output.scores[i], dim=-1).max(dim=-1).values.cpu().numpy()[0]
             for i in range(len(tokens))
         ]
 
-        print(scores)
+        print("Scores:", scores)
 
         uncertain_tokens = [i for i, score in enumerate(scores) if score < 0.5]
         for idx in uncertain_tokens:
-            tokens[idx] = " [MASK]"
-        masked_transcription = " ".join(tokens)
+            tokens[idx] = "[MASK]"
+        masked_transcription = join_words(tokens)
         print("Masked transcription:", masked_transcription)
 
         bert_input = bert_tokenizer(masked_transcription, return_tensors="pt").to(
@@ -122,11 +145,12 @@ def process_and_predict(
             as_tuple=True
         )[0]:
             idx = idx.item() - 1
-            print(idx)
             predicted_token_id = predictions_bert[0, idx + 1].argmax(axis=-1)
             tokens[idx] = bert_tokenizer.decode(predicted_token_id).replace(" ", "")
-        corrected_transcription = " ".join(tokens)
+        corrected_transcription = join_words(tokens)
         print("Corrected transcription:", corrected_transcription)
+
+        print("Reference: ", normalize(batch["text"]))
 
         predictions.append(normalize(corrected_transcription))
         references.append(normalize(batch["text"]))
