@@ -23,7 +23,7 @@ def load_and_filter_data():
     dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000))
     filtered_dataset = dataset.filter(filter_function)
     sampled_dataset = (
-        filtered_dataset["test"].shuffle().select(range(100))
+        filtered_dataset["test"].shuffle().select(range(10))
     )  # Select a smaller sample for testing
     return sampled_dataset
 
