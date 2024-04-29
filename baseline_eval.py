@@ -1,5 +1,5 @@
 ## Baseline evaluation of Whisper model from datasets
-## includes accents 
+## include accents 
 from datasets import load_dataset, Audio
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 import torch
@@ -7,6 +7,7 @@ import jiwer
 import werpy
 from evaluate import load
 import re
+from collections import defaultdict
 
 wer_standardize = jiwer.Compose([
     jiwer.ToLowerCase(),
@@ -48,27 +49,38 @@ def map_fn(batch):
     # Check each prediction for numbers
     predictions = []
     references = []
-    for result, reference in zip(results, batch["text"]):
+    accents = []
+    for result, reference, accent in zip(results, batch["text"], batch["accent"]):
         if not contains_number(result):
             predictions.append(normalize(result))
             references.append(normalize(reference))
+            accents.append(accent)
         else:
             # Append placeholder values for filtered samples
             predictions.append(None)
             references.append(None)
-    return {"predictions": predictions, "references": references}
+            accents.append(None)
+    return {"predictions": predictions, "references": references, "accents": accents}
 
 def filter_none_samples(example):
-    # Check if both predictions and references are not None
-    return example["predictions"] is not None and example["references"] is not None
+    # Check if predictions, references, and accents are not None
+    return example["predictions"] is not None and example["references"] is not None and example["accents"] is not None
 
-def calculate_metrics(filtered_ds, text_len_range):
+def calculate_metrics(filtered_ds, text_len_range, accent=None):
+    if accent:
+        filtered_ds = [ex for ex in filtered_ds if ex["accents"] == accent]
+
     predictions = [example["predictions"] for example in filtered_ds]
     references = [example["references"] for example in filtered_ds]
     wer_score = jiwer.wer(predictions, references)
     mer_score = jiwer.mer(predictions, references)
     wil_score = jiwer.wil(predictions, references)
-    print(f"Text length range: {text_len_range}")
+
+    if accent:
+        print(f"Text length range: {text_len_range}, Accent: {accent}")
+    else:
+        print(f"Text length range: {text_len_range}, All accents")
+
     print(f"WER: {wer_score * 100:.2f} %")
     print(f"MER: {mer_score * 100:.2f} %")
     print(f"WIL: {wil_score * 100:.2f} %")
@@ -84,8 +96,19 @@ for text_len_range in [(15, 30), (15, 100), (50, 100)]:
     filtered_dataset = dataset.filter(filter_function)
     ds = filtered_dataset["test"].map(map_fn, batch_size=4, remove_columns=[], batched=True)
     filtered_ds = ds.filter(filter_none_samples)
+
+    # Calculate metrics for all accents
     calculate_metrics(filtered_ds, text_len_range)
 
+    # Group samples by accent
+    samples_by_accent = defaultdict(list)
+    for sample in filtered_ds:
+        accent = sample["accents"]
+        samples_by_accent[accent].append(sample)
+
+    # Calculate metrics for each accent
+    for accent, samples in samples_by_accent.items():
+        calculate_metrics(samples, text_len_range, accent)
 
 # old code 
 ## Baseline evaluation of Whisper model 
