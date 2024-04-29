@@ -87,12 +87,9 @@ filtered_ds = ds.filter(filter_none_samples)
 predictions = [example["predictions"] for example in filtered_ds]
 references = [example["references"] for example in filtered_ds]
 
-wer = load("wer")
-mer = load("mer")
-wil = load("wil")
-wer_score = wer.compute(predictions=predictions, references=references)
-mer_score = mer.compute(predictions=predictions, references=references)
-wil_score = wil.compute(predictions=predictions, references=references)
+wer_score = jiwer.wer(predictions, references)
+mer_score = jiwer.mer(predictions, references)
+wil_score = jiwer.wil(predictions, references)
 print(f"WER: {wer_score * 100:.2f} %")
 print(f"MER: {mer_score * 100:.2f} %")
 print(f"WIL: {wil_score * 100:.2f} %")
