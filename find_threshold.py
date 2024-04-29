@@ -63,11 +63,13 @@ def _get_max_probs(examples):
     sampling_rate = examples['audio'][0]['sampling_rate']    
     input_features = processor.feature_extractor(waveforms, sampling_rate=sampling_rate, return_tensors="pt").input_features.to(device)
     outputs = model.generate(input_features, generation_config= model.generation_config, task='transcribe', language='english', return_dict_in_generate=True, use_cache=True)
-    batch_probs = [_process_logits(output['logits']) for output in outputs] ## list of lists of highest probabilities for each token in a sample 
+    batch_probs = [_process_logits(logits) for logits in outputs['logits']] ## list of lists of highest probabilities for each token in a sample 
     distribution.extend([probs for batch in batch_probs for probs in batch]) ## flatten and add to global list
 
 
-dataset['validation'].map(lambda example: _get_max_probs(example), batched=True, batch_size=4)
+print(type(dataset['validation']))
+print(len(dataset['validation']))
+dataset["validation"].shuffle(seed=42).select(range(8)).map(lambda example: _get_max_probs(example), batched=True, batch_size=4)
 
 print(len(distribution))
 
