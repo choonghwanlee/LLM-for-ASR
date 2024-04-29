@@ -63,8 +63,8 @@ def load_and_filter_data():
     dataset = load_dataset("edinburghcstr/edacc")
     dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000))
     filtered_dataset = dataset.filter(filter_function)
-    sampled_dataset = (
-        filtered_dataset["test"].shuffle().select(range(100))
+    sampled_dataset = filtered_dataset["test"].select(
+        range(10)
     )  # Select a smaller sample for testing
     return sampled_dataset
 
@@ -96,15 +96,20 @@ def process_and_predict(
         print("Original transcription:", transcription)
 
         tokens = whisper_processor.tokenizer.tokenize(transcription)
-        tokens = [token.replace("Ġ", " ") for token in tokens]
-        scores = (
-            output.scores[0].softmax(dim=-1).max(dim=-1).values.cpu().numpy()
-        )  # to-do
+        tokens = [token.replace("Ġ", "") for token in tokens]
+        print(tokens)
+
+        scores = [
+            torch.softmax(output.scores[i], dim=-1).max(dim=-1).values.cpu().numpy()[0]
+            for i in range(len(tokens))
+        ]
+
+        print(scores)
 
         uncertain_tokens = [i for i, score in enumerate(scores) if score < 0.5]
         for idx in uncertain_tokens:
-            tokens[idx] = "[MASK]"
-        masked_transcription = "".join(tokens)
+            tokens[idx] = " [MASK]"
+        masked_transcription = " ".join(tokens)
         print("Masked transcription:", masked_transcription)
 
         bert_input = bert_tokenizer(masked_transcription, return_tensors="pt").to(
@@ -115,11 +120,11 @@ def process_and_predict(
 
         for idx in (bert_input.input_ids == bert_tokenizer.mask_token_id)[0].nonzero(
             as_tuple=True
-        ):
-            predicted_token_id = predictions_bert[0, idx].argmax(axis=-1)
-            tokens[idx] = bert_tokenizer.decode(
-                predicted_token_id
-            )  # works til around here
+        )[0]:
+            idx = idx.item() - 1
+            print(idx)
+            predicted_token_id = predictions_bert[0, idx + 1].argmax(axis=-1)
+            tokens[idx] = bert_tokenizer.decode(predicted_token_id).replace(" ", "")
         corrected_transcription = " ".join(tokens)
         print("Corrected transcription:", corrected_transcription)
 
