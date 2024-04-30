@@ -62,18 +62,20 @@ def process_and_predict(
         transcriptions = whisper_processor.batch_decode(
             output.sequences, skip_special_tokens=True
         ) 
-        tokens = output.sequences ## how to associate tokens
-        normalized_probs = [F.softmax(logit) for logit in output['scores']] ## list of lists of normalized probs distributions per token
-        max_prob_per_token = [torch.max(probs).item() for probs in normalized_probs] ## list of maximum probabilities per token
-        uncertain_tokens = [index for index, prob in enumerate(max_prob_per_token) if prob < 0.5] ## indexes of tokens with max_prob < 0.5
-        ## for each uncertain token, replace it with [MASK], otherwise decode ##  
-        # ["[MASK]" for i, token in  range(len(tokens)) if i in uncertain_tokens else whisper_processor.decode(token)]
-        # masked_transcription = " ".join(transcript_as_list)
-        bert_input = bert_tokenizer(masked_transcription, return_tensors="pt")
-        masked_indices = torch.where(
-            bert_input["input_ids"] == bert_tokenizer.mask_token_id
-        )[1]
-        predictions_bert = bert_model(**bert_input.to(device)).logits
+        tokens = output.sequences ## list of token ids
+        normalized_probs = [F.softmax(logit) for logit in output['scores']] ## list of lists of normalized probability distributions per token ids
+        max_prob_per_token = [torch.max(probs).item() for probs in normalized_probs] ## list of maximum probabilities per token id 
+        uncertain_tokens = [index for index, prob in enumerate(max_prob_per_token) if prob < 0.5] ## indices of tokens with max_prob < 0.5
+        ## for each uncertain token, replace it with [MASK], otherwise decode ##
+        masked_transcription = ["[MASK]" if i in uncertain_tokens else whisper_processor.decode(token) for i, token, in enumerate(tokens)]
+        bert_input = bert_tokenizer(masked_transcription, return_tensors="pt").to(device)
+        # masked_indices = torch.where(
+        #     bert_input["input_ids"] == bert_tokenizer.mask_token_id
+        # )[1]
+        with torch.no_grad():
+            predictions_bert = bert_model(**bert_input).logits
+        mask_token_index = (bert_input.input_ids == bert_tokenizer.mask_token_id)[0].nonzero(as_tuple=True)[0]
+        
         predicted_token_id = predictions_bert[0, idx].argmax(axis=-1)
 
 
