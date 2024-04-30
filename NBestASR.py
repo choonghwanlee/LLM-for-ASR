@@ -3,8 +3,11 @@ from datasets import load_dataset, Audio
 from transformers import WhisperForConditionalGeneration, WhisperProcessor, BertTokenizer, BertForMaskedLM
 import werpy
 import jiwer
-from evaluate import load
+import torch.nn.functional as F
+# from evaluate import load
 import re
+from utils import get_punctuation_tokens
+
 
 wer_standardize = jiwer.Compose(
     [
@@ -78,34 +81,62 @@ def extract_uncertain(audio_sample):
             language='english',
             return_dict_in_generate=True
         )
-        logits = output['logits']
-        transcription = processor.batch_decode(output['sequences'], skip_special_tokens=True)[0]
+    to_modify= output['sequences']
+    logits = output['logits']
+    normalized_probs = [F.softmax(logit) for logit in logits]
+    max_prob_per_token = [torch.max(probs).item() for probs in normalized_probs] 
+    # transcription = processor.batch_decode(output['sequences'], skip_special_tokens=True)[0]
+    uncertain_tokens = [index for index, prob in enumerate(max_prob_per_token) if prob < uncertainty_threshold and to_modify[0][index] not in get_punctuation_tokens()] 
+    whisper_top_k = []
+    for i, index in enumerate(uncertain_tokens): ## for each uncertain token
+        top_k_index = torch.topk(normalized_probs[i], k=top_n_predictions).indices
+        whisper_top_k.append([processor.decode(val) for val in top_k_index[0]]) ## find the probability and token id of top 3
+        to_modify[0][index] = 50360
+    raw_transcript = processor.batch_decode(to_modify, skip_special_tokens=False)[0]
+    to_remove = ["<|startoftranscript|>", "<|translate|>", "<|en|>", "<|transcribe|>", "<|notimestamps|>", "<|endoftext|>", "<|startoflm|>"]
+    for substring in to_remove: 
+        if substring == "<|startoflm|>":
+            raw_transcript = raw_transcript.replace(substring, " [MASK]")
+        else:
+            raw_transcript = raw_transcript.replace(substring, "")
 
-        # Extract uncertain tokens
-        uncertain_indices = []
-        for i, logit in enumerate(logits):
-            if torch.max(logit).item() < uncertainty_threshold:
-                uncertain_indices.append(i)
-    
-    return transcription, uncertain_indices
+    return raw_transcript, uncertain_tokens, whisper_top_k
 
-def predict_masks(masked_text, uncertain_indices, top_n=top_n_predictions):
-    input_ids = tokenizer_bert(masked_text, return_tensors="pt").input_ids.to(device)
-    logits = model_bert(input_ids).logits
-
-    predicted_tokens = []
-    for idx, uncertain_idx in enumerate(uncertain_indices):
-        mask_logits = logits[0, uncertain_idx]
-        top_n_logits, top_n_ids = torch.topk(mask_logits, top_n, dim=-1)
-        predicted_tokens.append([tokenizer_bert.convert_ids_to_tokens([id])[0] for id in top_n_ids.tolist()])
+def predict_masks(masked_text, uncertain_indices, k_best):
+    whisper_k_best = []
+    for mask in k_best:
+        print('hi!')
+        whisper_k_best.append([val[1].item() for val in tokenizer_bert(mask, return_tensors="pt").input_ids])
+    print(whisper_k_best)
+    # whisper_top_k = [val[1].item() for val in tokenizer_bert(k_best, return_tensors="pt").input_ids]
+    bert_inputs = tokenizer_bert(masked_text, return_tensors="pt")
+    with torch.no_grad():
+        logits = model_bert(**bert_inputs).logits
+    # normalize values
+    normalized = [F.softmax(logit) for logit in logits]
+    input_tokens = bert_inputs.input_ids 
+    mask_token_index = (input_tokens == tokenizer_bert.mask_token_id)
+    # Find indices where values are True
+    mask_token_index = torch.nonzero(mask_token_index.flatten()).flatten()
+    bert_pred = []
+    for i, mask_idx in enumerate(mask_token_index): ## for each [MASK] token
+        candidates = [normalized[0][mask_idx][index] for index in whisper_k_best[i]] ## find the normalized probability of Whisper's top K
+        most_likely = whisper_k_best[i][candidates.index(max(candidates))] ## find the most likely token among the top K
+        input_tokens[0][mask_idx] = most_likely
+    return tokenizer_bert.batch_decode(input_tokens)
+    # predicted_tokens = []
+    # for idx, uncertain_idx in enumerate(uncertain_indices):
+    #     mask_logits = logits[0, uncertain_idx]
+    #     top_n_logits, top_n_ids = torch.topk(mask_logits, top_n, dim=-1)
+    #     predicted_tokens.append([tokenizer_bert.convert_ids_to_tokens([id])[0] for id in top_n_ids.tolist()])
         
-    return predicted_tokens
+    # return predicted_tokens
 
-def replace_uncertain_tokens(original_text, uncertain_indices, predicted_tokens):
-    words = original_text.split()
-    for i, idx in enumerate(uncertain_indices):
-        words[idx] = predicted_tokens[i][0]  # Replace with the token with highest logit value
-    return " ".join(words)
+# def replace_uncertain_tokens(original_text, uncertain_indices, predicted_tokens):
+#     words = original_text.split()
+#     for i, idx in enumerate(uncertain_indices):
+#         words[idx] = predicted_tokens[i][0]  # Replace with the token with highest logit value
+#     return " ".join(words)
 
 wer_scores = []
 wil_scores = []
@@ -117,16 +148,16 @@ for sample in filtered_dataset["test"]:
     ground_truth = sample['text']  # ground truth transcription
     accent = sample['accent']  # speaker accent 
     
-    # Extract uncertain tokens
-    transcription, uncertain_indices = extract_uncertain(audio_sample)
+    # Extract uncertain tokens and masked BERT input
+    transcription, uncertain_indices, k_best = extract_uncertain(audio_sample)
     
     # Predict top-N tokens using BERT MLM
-    predicted_tokens = predict_masks(transcription, uncertain_indices)
+    new_transcription = predict_masks(transcription, uncertain_indices, k_best)
     
     # Replace uncertain tokens with predicted tokens
-    corrected_text = replace_uncertain_tokens(transcription, uncertain_indices, predicted_tokens)
+    # corrected_text = replace_uncertain_tokens(transcription, uncertain_indices, predicted_tokens)
     normalized_ground_truth = normalize(ground_truth)
-    normalized_corrected_text = normalize(corrected_text)
+    normalized_corrected_text = normalize(new_transcription)
     
     # Calculate number of words
     num_words.append(len(normalized_ground_truth.split()))
